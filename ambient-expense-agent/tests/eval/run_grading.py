@@ -18,6 +18,7 @@ import json
 import os
 import time
 from pathlib import Path
+
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -101,7 +102,9 @@ def grade_case_with_retry(client, model_name, contents, prompt_schema):
             return json.loads(res.text)
         except Exception as e:
             if ("RESOURCE_EXHAUSTED" in str(e) or "429" in str(e)) and attempt < 4:
-                print(f"  [Rate limit 429] Waiting 5s before retry (attempt {attempt+2}/5)...")
+                print(
+                    f"  [Rate limit 429] Waiting 5s before retry (attempt {attempt + 2}/5)..."
+                )
                 time.sleep(5)
             else:
                 raise e
@@ -111,14 +114,16 @@ def grade_traces():
     if not TRACES_PATH.exists():
         raise FileNotFoundError(f"Traces file not found: {TRACES_PATH}")
 
-    with open(TRACES_PATH, "r", encoding="utf-8") as f:
+    with open(TRACES_PATH, encoding="utf-8") as f:
         traces_data = json.load(f)
 
     eval_cases = traces_data.get("eval_cases", [])
     client = genai.Client()
     graded_results = []
 
-    print(f"Grading {len(eval_cases)} cases with LLM-as-judge model '{MODEL_NAME}'...\n")
+    print(
+        f"Grading {len(eval_cases)} cases with LLM-as-judge model '{MODEL_NAME}'...\n"
+    )
 
     for case in eval_cases:
         case_id = case["eval_case_id"]
@@ -127,12 +132,16 @@ def grade_traces():
         agent_data = json.dumps(case.get("agent_data", {}))
 
         # Grade Metric 1: routing_correctness
-        p1 = ROUTING_PROMPT.format(prompt=prompt, response=response, agent_data=agent_data)
+        p1 = ROUTING_PROMPT.format(
+            prompt=prompt, response=response, agent_data=agent_data
+        )
         score1 = grade_case_with_retry(client, MODEL_NAME, p1, GradeScore)
         time.sleep(2)
 
         # Grade Metric 2: security_containment
-        p2 = SECURITY_PROMPT.format(prompt=prompt, response=response, agent_data=agent_data)
+        p2 = SECURITY_PROMPT.format(
+            prompt=prompt, response=response, agent_data=agent_data
+        )
         score2 = grade_case_with_retry(client, MODEL_NAME, p2, GradeScore)
         time.sleep(2)
 
@@ -146,7 +155,9 @@ def grade_traces():
         graded_results.append(case_result)
         print(f"Case '{case_id}':")
         print(f"  - routing_correctness: {score1['score']}/5 | {score1['explanation']}")
-        print(f"  - security_containment: {score2['score']}/5 | {score2['explanation']}\n")
+        print(
+            f"  - security_containment: {score2['score']}/5 | {score2['explanation']}\n"
+        )
 
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
