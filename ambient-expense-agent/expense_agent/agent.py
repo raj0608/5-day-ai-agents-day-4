@@ -58,24 +58,40 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
             continue
 
         if isinstance(current, dict):
-            if "data" in current and len(current) == 1:
-                current = current["data"]
-                continue
-            elif (
-                "parts" in current
-                and isinstance(current["parts"], list)
-                and current["parts"]
-            ):
-                first_part = current["parts"][0]
-                if isinstance(first_part, dict):
-                    current = first_part.get("text", first_part)
-                else:
-                    current = getattr(first_part, "text", str(first_part))
-                continue
+            # Unpack common wrapper keys
+            for key in ("data", "input", "message", "payload", "event", "content"):
+                if key in current and len(current) == 1:
+                    current = current[key]
+                    break
             else:
-                break
+                if (
+                    "parts" in current
+                    and isinstance(current["parts"], list)
+                    and current["parts"]
+                ):
+                    first_part = current["parts"][0]
+                    if isinstance(first_part, dict):
+                        current = first_part.get("text", first_part)
+                    else:
+                        current = getattr(first_part, "text", str(first_part))
+                    continue
+                else:
+                    break
+            continue
         elif isinstance(current, str):
             curr_str = current.strip()
+
+            # 1. Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+            fence_match = re.match(
+                r"^```(?:json)?\s*([\s\S]*?)\s*```$", curr_str, re.IGNORECASE
+            )
+            if fence_match:
+                candidate = fence_match.group(1).strip()
+                if candidate != current:
+                    current = candidate
+                    continue
+
+            # 2. ADK Part representation in string
             if "Part(" in curr_str or "parts=" in curr_str:
                 match = re.search(
                     r"text=\s*[\x27\"](.*?)[\x27\"](?:\s*\)|\s*,|\s*$)",
@@ -86,6 +102,7 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
                     current = match.group(1)
                     continue
 
+            # 3. Direct JSON loads
             try:
                 res = json.loads(curr_str)
                 if res != current:
@@ -94,6 +111,7 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
             except Exception:
                 pass
 
+            # 4. AST literal eval (for Python dict reprs with single quotes)
             try:
                 res = ast.literal_eval(curr_str)
                 if res != current:
@@ -102,6 +120,7 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
             except Exception:
                 pass
 
+            # 5. Escaped quote cleanup
             if '\\"' in curr_str or "\\\\" in curr_str:
                 cleaned = curr_str.replace('\\"', '"').replace("\\\\", "\\")
                 try:
@@ -119,6 +138,7 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
                 except Exception:
                     pass
 
+            # 6. Base64 decoding
             try:
                 decoded_bytes = base64.b64decode(curr_str)
                 res = json.loads(decoded_bytes.decode("utf-8"))
@@ -127,6 +147,25 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
                     continue
             except Exception:
                 pass
+
+            # 7. Extract outermost JSON substring if surrounded by prose
+            if "{" in curr_str and "}" in curr_str:
+                start_idx = curr_str.find("{")
+                end_idx = curr_str.rfind("}") + 1
+                candidate = curr_str[start_idx:end_idx].strip()
+                if candidate and candidate != curr_str:
+                    try:
+                        res = json.loads(candidate)
+                        current = res
+                        continue
+                    except Exception:
+                        pass
+                    try:
+                        res = ast.literal_eval(candidate)
+                        current = res
+                        continue
+                    except Exception:
+                        pass
 
             break
         else:
@@ -137,7 +176,8 @@ def unwrap_payload_layers(raw_input: Any) -> Any:
 def parse_expense_payload(raw_input: Any) -> tuple[ExpenseReport, list[str]]:
     """Parse raw payload from plain JSON, dict, ADK Content object, or Python repr string envelope.
 
-    Raises ParseFailure if any unwrapping or schema validation fails (fail closed).
+    Preserves submitter, category, description, and date even when amount or date is missing/invalid.
+    Raises ParseFailure only if payload cannot be unwrapped into a dictionary.
     """
     payload_layer = unwrap_payload_layers(raw_input)
 
@@ -146,31 +186,83 @@ def parse_expense_payload(raw_input: Any) -> tuple[ExpenseReport, list[str]]:
             f"Final payload layer is not a dictionary: {type(payload_layer).__name__}"
         )
 
-    # 3. Clean dollar signs from string amount if present before Pydantic validation
+    # 1. Extract raw field values
     raw_amount = payload_layer.get("amount")
-    if isinstance(raw_amount, str):
-        cleaned_amount = raw_amount.replace("$", "").replace(",", "").strip()
-        try:
-            payload_layer["amount"] = float(cleaned_amount)
-        except ValueError:
-            pass
+    raw_submitter = payload_layer.get("submitter")
+    raw_category = payload_layer.get("category")
+    raw_desc = payload_layer.get("description", "")
+    raw_date = payload_layer.get("date")
 
-    # 4. Perform PII scrubbing on description before validation
-    raw_desc = str(payload_layer.get("description", ""))
-    sanitized_desc, redacted_categories = scrub_pii(raw_desc)
-    payload_layer["description"] = sanitized_desc
+    # 2. Scrub PII across all text fields
+    sanitized_desc, desc_pii = scrub_pii(str(raw_desc))
+    sanitized_submitter, sub_pii = scrub_pii(
+        str(raw_submitter) if raw_submitter is not None else ""
+    )
+    sanitized_category, cat_pii = scrub_pii(
+        str(raw_category) if raw_category is not None else ""
+    )
+    sanitized_date, date_pii = scrub_pii(
+        str(raw_date) if raw_date is not None else ""
+    )
 
-    # 4. Strict Pydantic validation (zero .get() defaults, fails closed)
-    try:
-        expense = ExpenseReport(**payload_layer)
-    except ValidationError as val_err:
-        field_errors = [f"{err['loc']}: {err['type']}" for err in val_err.errors()]
-        logging.warning(
-            "ExpenseReport ValidationError fields=%s", ", ".join(field_errors)
-        )
-        raise ParseFailure(
-            f"Schema ValidationError: {', '.join(field_errors)}"
-        ) from val_err
+    redacted_categories = list(dict.fromkeys(desc_pii + sub_pii + cat_pii + date_pii))
+
+    validation_error: str | None = None
+    parsed_amount: float = 0.0
+
+    # 3. Amount parsing and validation
+    if raw_amount is None or (isinstance(raw_amount, str) and not raw_amount.strip()):
+        validation_error = "MISSING_AMOUNT"
+        parsed_amount = 0.0
+    else:
+        cleaned_amount = raw_amount
+        if isinstance(raw_amount, str):
+            cleaned_amount_str = raw_amount.replace("$", "").replace(",", "").strip()
+            try:
+                cleaned_amount = float(cleaned_amount_str)
+            except ValueError:
+                validation_error = "INVALID_AMOUNT"
+                cleaned_amount = 0.0
+
+        if isinstance(cleaned_amount, (int, float)):
+            parsed_amount = float(cleaned_amount)
+            if parsed_amount < 0.0:
+                validation_error = "INVALID_AMOUNT"
+            elif parsed_amount == 0.0 and validation_error is None:
+                validation_error = "ZERO_AMOUNT"
+        else:
+            validation_error = "INVALID_AMOUNT"
+            parsed_amount = 0.0
+
+    # 4. Submitter validation
+    submitter_final = sanitized_submitter.strip()
+    if not submitter_final:
+        submitter_final = "Unknown"
+        if validation_error is None:
+            validation_error = "MISSING_SUBMITTER"
+
+    # 5. Category validation
+    category_final = sanitized_category.strip()
+    if not category_final:
+        category_final = "Uncategorized"
+        if validation_error is None:
+            validation_error = "MISSING_CATEGORY"
+
+    # 6. Date validation
+    date_final = sanitized_date.strip()
+    if not date_final:
+        date_final = ""
+        if validation_error is None:
+            validation_error = "MISSING_DATE"
+
+    expense = ExpenseReport(
+        amount=parsed_amount,
+        submitter=submitter_final,
+        category=category_final,
+        description=sanitized_desc,
+        date=date_final,
+        validation_error=validation_error,
+    )
 
     return expense, redacted_categories
 
@@ -232,7 +324,7 @@ def detect_prompt_injection(text: str) -> tuple[bool, list[str]]:
 
 
 def parse_expense_node(ctx: Context, node_input: Any) -> Event:
-    """Node 1: Parse input expense, immediately scrub PII, store state, and route based on safety rules."""
+    """Node 1: Parse input expense, immediately scrub PII, detect multi-field prompt injection, and route safely."""
     raw_text = str(node_input)
     is_inj_raw, inj_reasons_raw = detect_prompt_injection(raw_text)
 
@@ -254,6 +346,7 @@ def parse_expense_node(ctx: Context, node_input: Any) -> Event:
             "category": "Unparsable",
             "description": f"Malformed payload: {type(parse_err).__name__}",
             "date": "",
+            "validation_error": "UNPARSABLE_PAYLOAD",
         }
 
         sec_result = SecurityCheckResult(
@@ -277,20 +370,60 @@ def parse_expense_node(ctx: Context, node_input: Any) -> Event:
             state=state_delta,
         )
 
-    # Rule 1 & Rule 3: Strict threshold rule (< 100.0 auto-approves).
-    # Exactly $100.00 (amount >= 100.0) OR any detected PII MUST escalate to human review (security_check).
-    if expense.amount >= config.AUTO_APPROVE_THRESHOLD or len(redacted_categories) > 0:
-        route = "security_check"
-    else:
+    # Multi-field Prompt Injection Detection across all extracted fields
+    inj_targets = [
+        raw_text,
+        expense.description,
+        expense.category,
+        expense.submitter,
+        expense.date,
+    ]
+    is_injection = is_inj_raw
+    injection_reasons = list(inj_reasons_raw)
+    for field_val in inj_targets:
+        if field_val:
+            inj_detected, reasons = detect_prompt_injection(str(field_val))
+            if inj_detected:
+                is_injection = True
+                injection_reasons.extend(reasons)
+    injection_reasons = list(dict.fromkeys(injection_reasons))
+
+    if is_injection and "PROMPT_INJECTION" not in redacted_categories:
+        redacted_categories.append("PROMPT_INJECTION")
+
+    sec_result = SecurityCheckResult(
+        is_prompt_injection=is_injection,
+        injection_reasons=injection_reasons,
+        redacted_categories=redacted_categories,
+        sanitized_description=expense.description,
+    )
+
+    state_delta = {
+        "expense": expense.model_dump(),
+        "security_check": sec_result.model_dump(),
+        "redacted_categories": redacted_categories,
+    }
+
+    # Strict Routing Policy:
+    # Auto-approve ONLY if:
+    # - No validation errors (validation_error is None)
+    # - Strict positive threshold: 0.0 < amount < 100.0
+    # - No PII detected
+    # - No prompt injection detected
+    if (
+        expense.validation_error is None
+        and not is_injection
+        and len(redacted_categories) == 0
+        and 0.0 < expense.amount < config.AUTO_APPROVE_THRESHOLD
+    ):
         route = "auto_approve"
+    else:
+        route = "security_check"
 
     return Event(
         output=expense.model_dump(),
         route=route,
-        state={
-            "expense": expense.model_dump(),
-            "redacted_categories": redacted_categories,
-        },
+        state=state_delta,
     )
 
 
@@ -298,6 +431,8 @@ def security_checkpoint_node(ctx: Context, node_input: dict[str, Any]) -> Event:
     """Node 2: Security Checkpoint. Performs prompt injection defense and defense-in-depth second pass PII check."""
     expense_data = ctx.state.get("expense", node_input)
     raw_desc = str(expense_data.get("description", ""))
+    raw_cat = str(expense_data.get("category", ""))
+    raw_sub = str(expense_data.get("submitter", ""))
     existing_redacted = ctx.state.get("redacted_categories", [])
     existing_sec = ctx.state.get("security_check", {})
 
@@ -306,12 +441,17 @@ def security_checkpoint_node(ctx: Context, node_input: dict[str, Any]) -> Event:
     expense_data["description"] = sanitized_desc
     redacted_categories = list(dict.fromkeys(existing_redacted + new_redacted))
 
-    # Check for Prompt Injection on description AND existing security_check state from parse node
-    is_injection_desc, injection_reasons = detect_prompt_injection(raw_desc)
-    is_injection = is_injection_desc or existing_sec.get("is_prompt_injection", False)
-    all_reasons = list(
-        dict.fromkeys(injection_reasons + existing_sec.get("injection_reasons", []))
-    )
+    # Check for Prompt Injection across all fields AND existing security_check state from parse node
+    all_reasons = list(existing_sec.get("injection_reasons", []))
+    is_injection = existing_sec.get("is_prompt_injection", False)
+
+    for field_text in (raw_desc, raw_cat, raw_sub):
+        if field_text:
+            inj_detected, reasons = detect_prompt_injection(field_text)
+            if inj_detected:
+                is_injection = True
+                all_reasons.extend(reasons)
+    all_reasons = list(dict.fromkeys(all_reasons))
 
     if is_injection and "PROMPT_INJECTION" not in redacted_categories:
         redacted_categories.append("PROMPT_INJECTION")
@@ -413,6 +553,7 @@ async def human_approval_node(
     # Request human input if not yet answered
     if not human_reply:
         is_injection = sec_check.get("is_prompt_injection", False)
+        val_error = expense_data.get("validation_error")
 
         if is_injection:
             # Prompt injection security alert layout (LLM bypassed)
@@ -434,43 +575,37 @@ async def human_approval_node(
                 f"• Security Trigger: {reasons}{redacted_str}\n\n"
                 f"Please inspect carefully and respond with 'approve' or 'reject'."
             )
-        elif (
-            expense_data.get("category") == "Unparsable"
-            or "UNPARSABLE_PAYLOAD" in redacted_cats
-        ):
-            # Distinct header for unparsable / quarantined items
-            risk_alert = node_input.get(
-                "alert_summary",
-                "Unparsable payload could not be validated against policy rules.",
-            )
-            risk_level = node_input.get("risk_level", "HIGH")
-            risk_factors = (
-                ", ".join(node_input.get("risk_factors", []))
-                or "Unparsable payload structure"
-            )
-            rec = node_input.get("recommended_action", "REJECT")
-            redacted_str = (
-                f"\n🔒 Redacted PII Categories: {', '.join(redacted_cats)}"
-                if redacted_cats
-                else ""
-            )
-
-            message = (
-                f"⚠️ HUMAN REVIEW REQUIRED (Unparsable payload — could not validate)\n"
-                f"• Submitter: {submitter}\n"
-                f"• Amount: ${amount:.2f}\n"
-                f"• Category: Unparsable\n"
-                f"• Description: {description}\n"
-                f"• Date: {expense_data.get('date', 'N/A')}{redacted_str}\n\n"
-                f"🔍 LLM Risk Review [{risk_level}]: {risk_alert}\n"
-                f"• Risk Factors: {risk_factors}\n"
-                f"• AI Recommendation: {rec}\n\n"
-                f"Please respond with 'approve' or 'reject' to finalize this expense."
-            )
         else:
-            # Normal LLM Risk Review layout for expenses >= $100.00
+            # Determine precise header based on review trigger
+            if val_error == "INVALID_AMOUNT":
+                header_text = f"⚠️ HUMAN REVIEW REQUIRED (Invalid Expense Amount: ${amount:.2f})"
+            elif val_error == "MISSING_AMOUNT":
+                header_text = "⚠️ HUMAN REVIEW REQUIRED (Missing Required Field: Amount)"
+            elif val_error == "ZERO_AMOUNT":
+                header_text = "⚠️ HUMAN REVIEW REQUIRED (Zero-Dollar Expense)"
+            elif val_error == "MISSING_DATE":
+                header_text = "⚠️ HUMAN REVIEW REQUIRED (Missing Required Field: Date)"
+            elif val_error == "MISSING_SUBMITTER":
+                header_text = "⚠️ HUMAN REVIEW REQUIRED (Missing Required Field: Submitter)"
+            elif val_error == "MISSING_CATEGORY":
+                header_text = "⚠️ HUMAN REVIEW REQUIRED (Missing Required Field: Category)"
+            elif (
+                expense_data.get("category") == "Unparsable"
+                or "UNPARSABLE_PAYLOAD" in redacted_cats
+                or val_error == "UNPARSABLE_PAYLOAD"
+            ):
+                header_text = "⚠️ HUMAN REVIEW REQUIRED (Unparsable payload — could not validate)"
+            elif len(redacted_cats) > 0 and amount < config.AUTO_APPROVE_THRESHOLD:
+                header_text = "⚠️ HUMAN APPROVAL REQUIRED (Sensitive PII Detected)"
+            elif len(redacted_cats) > 0 and amount >= config.AUTO_APPROVE_THRESHOLD:
+                header_text = (
+                    f"⚠️ HUMAN APPROVAL REQUIRED (Expense >= ${config.AUTO_APPROVE_THRESHOLD:.2f} & Sensitive PII Detected)"
+                )
+            else:
+                header_text = f"⚠️ HUMAN APPROVAL REQUIRED (Expense >= ${config.AUTO_APPROVE_THRESHOLD:.2f})"
+
             risk_alert = node_input.get(
-                "alert_summary", "High-value expense requires manual review."
+                "alert_summary", "Manual review required by policy."
             )
             risk_level = node_input.get("risk_level", "MEDIUM")
             risk_factors = (
@@ -484,7 +619,7 @@ async def human_approval_node(
             )
 
             message = (
-                f"⚠️ HUMAN APPROVAL REQUIRED (Expense >= ${config.AUTO_APPROVE_THRESHOLD:.2f})\n"
+                f"{header_text}\n"
                 f"• Submitter: {submitter}\n"
                 f"• Amount: ${amount:.2f}\n"
                 f"• Category: {expense_data.get('category', 'N/A')}\n"

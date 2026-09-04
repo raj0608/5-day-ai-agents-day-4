@@ -20,15 +20,24 @@ from pydantic import BaseModel, Field
 class ExpenseReport(BaseModel):
     """Normalized expense report data structure."""
 
-    amount: float = Field(..., ge=0, description="Expense total in USD")
-    submitter: str = Field(..., description="Person who submitted the expense")
+    amount: float = Field(default=0.0, description="Expense total in USD")
+    submitter: str = Field(
+        default="Unknown", description="Person who submitted the expense"
+    )
     category: str = Field(
-        ..., description="Expense category (e.g. Travel, Meals, Supplies)"
+        default="Uncategorized",
+        description="Expense category (e.g. Travel, Meals, Supplies)",
     )
     description: str = Field(
-        ..., description="Description/justification of the expense"
+        default="", description="Description/justification of the expense"
     )
-    date: str = Field(..., description="Date of the expense in YYYY-MM-DD format")
+    date: str = Field(
+        default="", description="Date of the expense in YYYY-MM-DD format"
+    )
+    validation_error: str | None = Field(
+        default=None,
+        description="Validation error code if any (e.g. MISSING_AMOUNT, INVALID_AMOUNT)",
+    )
 
 
 class SecurityCheckResult(BaseModel):
