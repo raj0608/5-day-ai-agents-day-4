@@ -52,7 +52,7 @@ select = [
     "UP", # pyupgrade
     "RUF", # ruff specific rules
 ]
-ignore = ["E501", "C901", "B006"] # ignore line too long, too complex
+ignore = ["E501", "C901", "B006", "E402"] # ignore line too long, too complex, module import location
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "frontend"]
@@ -77,6 +77,7 @@ invalid-return-type = "ignore"
 possibly-missing-attribute = "ignore"
 not-subscriptable = "ignore"
 deprecated = "ignore"
+pydantic-discarded-extra-argument = "ignore"
 
 [tool.codespell]
 ignore-words-list = "rouge"
@@ -93,6 +94,6 @@ pythonpath = "."
 asyncio_default_fixture_loop_scope = "session"
 
 [tool.hatch.build.targets.wheel]
-packages = ["app","frontend"]
+packages = ["app", "expense_agent"]
 
 

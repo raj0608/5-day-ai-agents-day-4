@@ -14,22 +14,22 @@
 
 """Ambient Expense Approval Web Service accepting Pub/Sub event triggers."""
 
-import base64
 import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.runners import Runner
 from google.genai import types
 
 from app.agent import app as adk_app
-from app.agent import root_agent
 from app.app_utils import services
 from expense_agent.agent import scrub_pii
 
@@ -72,7 +72,9 @@ app: FastAPI = get_fast_api_app(
     lifespan=lifespan,
 )
 app.title = "Ambient Expense Approval Service"
-app.description = "Ambient web service processing GCP Pub/Sub triggers for expense workflow approvals"
+app.description = (
+    "Ambient web service processing GCP Pub/Sub triggers for expense workflow approvals"
+)
 
 
 def normalize_subscription_name(raw_subscription: str | None) -> str:
@@ -136,16 +138,22 @@ async def process_pubsub_event(request: Request) -> dict[str, Any]:
 
     # Gotcha handling: Normalize fully-qualified subscription path down to short name
     short_subscription = normalize_subscription_name(raw_subscription)
-    message_id = message.get("messageId", "msg-001") if isinstance(message, dict) else "msg-001"
+    message_id = (
+        message.get("messageId", "msg-001") if isinstance(message, dict) else "msg-001"
+    )
 
     # Construct readable session ID using normalized subscription name
     session_id = f"{short_subscription}-{message_id}"
     user_id = f"pubsub-subscriber-{short_subscription}"
 
     # Extract message data payload (base64 string or dict)
-    message_data = message.get("data", message) if isinstance(message, dict) else message
+    message_data = (
+        message.get("data", message) if isinstance(message, dict) else message
+    )
 
-    logger.info(f"Normalized subscription: '{short_subscription}', Session ID: '{session_id}'")
+    logger.info(
+        f"Normalized subscription: '{short_subscription}', Session ID: '{session_id}'"
+    )
 
     runner: Runner = app.state.runner
     session = await runner.session_service.create_session(
@@ -155,8 +163,10 @@ async def process_pubsub_event(request: Request) -> dict[str, Any]:
     )
 
     # Input message passed to workflow
-    input_text = json.dumps({"data": message_data}) if not isinstance(message_data, str) else json.dumps({"data": message_data})
-    user_content = types.Content(role="user", parts=[types.Part.from_text(text=input_text)])
+    input_text = json.dumps({"data": message_data})
+    user_content = types.Content(
+        role="user", parts=[types.Part.from_text(text=input_text)]
+    )
 
     outputs = []
     contents = []
@@ -178,7 +188,9 @@ async def process_pubsub_event(request: Request) -> dict[str, Any]:
                     logger.info(f"Workflow content message: {part.text}")
                 elif getattr(part, "function_call", None):
                     fc = part.function_call
-                    if getattr(fc, "name", "") == "adk_request_input" and isinstance(fc.args, dict):
+                    if getattr(fc, "name", "") == "adk_request_input" and isinstance(
+                        fc.args, dict
+                    ):
                         msg = fc.args.get("message")
                         if msg:
                             contents.append(msg)
@@ -196,6 +208,74 @@ async def process_pubsub_event(request: Request) -> dict[str, Any]:
         "outputs": final_outputs,
         "messages": contents,
     }
+
+
+@app.post("/stream_reasoning_engine")
+@app.post("/reasoning_engine")
+@app.post("/api/stream_reasoning_engine")
+@app.post("/api/reasoning_engine")
+@app.post("/run_sse")
+@app.post("/run")
+async def handle_reasoning_engine_playground(request: Request) -> Any:
+    """Handles Agent Platform Playground queries sent to /api/stream_reasoning_engine."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Extract user input query text from Playground payload formats
+    input_data = body.get("input", body.get("message", body.get("query", body)))
+    if isinstance(input_data, dict):
+        input_text_str = str(
+            input_data.get("message", input_data.get("data", json.dumps(input_data)))
+        )
+    else:
+        input_text_str = str(input_data)
+
+    user_id = str(body.get("user_id", "playground-user"))
+    session_id = str(body.get("session_id", f"playground-{int(time.time())}"))
+
+    runner: Runner = app.state.runner
+    try:
+        session = await runner.session_service.get_session(
+            app_name=adk_app.name,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    except Exception:
+        session = None
+
+    if not session:
+        session = await runner.session_service.create_session(
+            app_name=adk_app.name,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+    input_text = json.dumps({"data": input_text_str})
+    user_content = types.Content(
+        role="user", parts=[types.Part.from_text(text=input_text)]
+    )
+
+    async def json_stream() -> AsyncIterator[str]:
+        async for event in runner.run_async(
+            user_id=user_id,
+            session_id=session.id,
+            new_message=user_content,
+        ):
+            event_payload: dict[str, Any] = {}
+            if hasattr(event, "content") and event.content:
+                event_payload["content"] = event.content.model_dump(
+                    mode="json", exclude_none=True
+                )
+            if hasattr(event, "output") and event.output:
+                event_payload["output"] = event.output
+            if hasattr(event, "author") and event.author:
+                event_payload["author"] = event.author
+
+            yield f"{json.dumps(event_payload)}\n"
+
+    return StreamingResponse(json_stream(), media_type="application/json")
 
 
 if __name__ == "__main__":

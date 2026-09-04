@@ -15,6 +15,7 @@
 """Configuration parameters for ambient expense agent."""
 
 import os
+
 from dotenv import load_dotenv
 
 # Automatically load environment variables from .env file

@@ -17,4 +17,4 @@
 from . import config, schemas
 from .agent import app, root_agent
 
-__all__ = ["root_agent", "app", "config", "schemas"]
+__all__ = ["app", "config", "root_agent", "schemas"]
