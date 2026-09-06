@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -217,30 +218,128 @@ async def process_pubsub_event(request: Request) -> dict[str, Any]:
 @app.post("/run_sse")
 @app.post("/run")
 async def handle_reasoning_engine_playground(request: Request) -> Any:
-    """Handles Agent Platform Playground queries sent to /api/stream_reasoning_engine."""
+    """Handles Agent Platform Playground queries sent to /api/stream_reasoning_engine, /run_sse, etc."""
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    # Extract user input query text from Playground payload formats
-    input_data = body.get("input", body.get("message", body.get("query", body)))
-    if isinstance(input_data, dict):
-        input_text_str = str(
-            input_data.get("message", input_data.get("data", json.dumps(input_data)))
-        )
-    else:
-        input_text_str = str(input_data)
+    # Probe / health check handling: if body is empty or null, return immediately
+    if not body:
+        return {"status": "ok", "service": "ambient-expense-agent"}
 
-    user_id = str(body.get("user_id", "playground-user"))
-    session_id = str(body.get("session_id", f"playground-{int(time.time())}"))
+    # Extract user_id and session_id from body or input dictionary (supports camelCase and snake_case)
+    input_dict = body.get("input") if isinstance(body.get("input"), dict) else {}
+
+    user_id = str(
+        body.get("userId")
+        or body.get("user_id")
+        or input_dict.get("userId")
+        or input_dict.get("user_id")
+        or "playground-user"
+    )
+    raw_session_id = str(
+        body.get("sessionId")
+        or body.get("session_id")
+        or input_dict.get("sessionId")
+        or input_dict.get("session_id")
+        or f"playground-{int(time.time())}"
+    )
+    # Sanitize session_id to conform to Vertex AI rules: lowercase letters, digits, and hyphens only
+    session_id = re.sub(r"[^a-z0-9-]+", "-", raw_session_id.lower()).strip("-")
+    if not session_id:
+        session_id = f"session-{int(time.time())}"
+
+    # Extract user input query text or structured resume message
+    raw_message = (
+        body.get("newMessage")
+        or input_dict.get("newMessage")
+        or input_dict.get("message")
+        or body.get("message")
+        or body.get("input")
+        or body.get("query")
+        or body
+    )
+
+    user_content: types.Content | None = None
+
+    # Check if raw_message is an ADK Content / function_response envelope
+    if isinstance(raw_message, dict) and ("parts" in raw_message or "role" in raw_message):
+        try:
+            user_content = types.Content.model_validate(raw_message)
+            if not user_content.role:
+                user_content.role = "user"
+        except Exception as val_err:
+            logger.warning("Could not model_validate Content directly: %s; constructing manually", val_err)
+            if "parts" in raw_message and isinstance(raw_message["parts"], list):
+                parts = []
+                for p in raw_message["parts"]:
+                    if isinstance(p, dict) and "function_response" in p:
+                        fr = p["function_response"]
+                        parts.append(
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    id=fr.get("id", "human_decision"),
+                                    name=fr.get("name", "adk_request_input"),
+                                    response=fr.get("response", {}),
+                                )
+                            )
+                        )
+                    elif isinstance(p, dict) and "text" in p:
+                        parts.append(types.Part.from_text(text=str(p["text"])))
+                user_content = types.Content(role=raw_message.get("role", "user"), parts=parts)
+
+    is_resume = False
+    if user_content and user_content.parts:
+        for p in user_content.parts:
+            if getattr(p, "function_response", None):
+                is_resume = True
+                break
+
+    if user_content is None:
+        if isinstance(raw_message, dict):
+            input_text_str = str(
+                raw_message.get("data", raw_message.get("message", json.dumps(raw_message)))
+            )
+        else:
+            input_text_str = str(raw_message)
+
+        input_text = json.dumps({"data": input_text_str})
+        user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text=input_text)]
+        )
 
     runner: Runner = app.state.runner
+
+    # Maintain session isolation:
+    # 1. If resuming from an interrupt, always use the original session_id.
+    # 2. If a session already finished its workflow (has terminal status), isolate the new submission
+    #    to prevent ADK ReplaySequenceBarrier divergence.
+    # 3. If a past session throws an ownership error (different user_id), isolate to avoid 400 ALREADY_EXISTS.
+    effective_session_id = session_id
+    if not is_resume:
+        try:
+            existing_sess = await runner.session_service.get_session(
+                app_name=adk_app.name,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if existing_sess and existing_sess.events:
+                has_completed = any(
+                    isinstance(getattr(e, "output", None), dict) and "status" in e.output
+                    for e in existing_sess.events
+                )
+                if has_completed:
+                    effective_session_id = f"{session_id}-t{int(time.time() * 1000)}"
+        except Exception:
+            # Past session belongs to a different user_id or is inaccessible; isolate to avoid ALREADY_EXISTS
+            effective_session_id = f"{session_id}-t{int(time.time() * 1000)}"
+
     try:
         session = await runner.session_service.get_session(
             app_name=adk_app.name,
             user_id=user_id,
-            session_id=session_id,
+            session_id=effective_session_id,
         )
     except Exception:
         session = None
@@ -249,13 +348,8 @@ async def handle_reasoning_engine_playground(request: Request) -> Any:
         session = await runner.session_service.create_session(
             app_name=adk_app.name,
             user_id=user_id,
-            session_id=session_id,
+            session_id=effective_session_id,
         )
-
-    input_text = json.dumps({"data": input_text_str})
-    user_content = types.Content(
-        role="user", parts=[types.Part.from_text(text=input_text)]
-    )
 
     async def json_stream() -> AsyncIterator[str]:
         async for event in runner.run_async(
@@ -263,14 +357,29 @@ async def handle_reasoning_engine_playground(request: Request) -> Any:
             session_id=session.id,
             new_message=user_content,
         ):
+            # Check for actual user-facing text content
+            has_text = False
+            if hasattr(event, "content") and event.content and event.content.parts:
+                for p in event.content.parts:
+                    if getattr(p, "text", None):
+                        has_text = True
+                        break
+
+            has_status = hasattr(event, "output") and isinstance(event.output, dict) and "status" in event.output
+
+            # Suppress internal node execution events that have neither user-facing text nor final status
+            # This prevents empty assistant chat bubbles (#5, #6) from appearing in the Playground UI
+            if not has_text and not has_status:
+                continue
+
             event_payload: dict[str, Any] = {}
-            if hasattr(event, "content") and event.content:
+            if has_text and hasattr(event, "content") and event.content:
                 event_payload["content"] = event.content.model_dump(
                     mode="json", exclude_none=True
                 )
-            if hasattr(event, "output") and event.output:
+            if has_status and hasattr(event, "output") and event.output:
                 event_payload["output"] = event.output
-            if hasattr(event, "author") and event.author:
+            if has_text and hasattr(event, "author") and event.author:
                 event_payload["author"] = event.author
 
             yield f"{json.dumps(event_payload)}\n"

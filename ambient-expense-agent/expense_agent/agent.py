@@ -34,7 +34,7 @@ from google.adk.agents.context import Context
 from google.adk.apps import App, ResumabilityConfig
 from google.adk.events.event import Event
 from google.adk.events.request_input import RequestInput
-from google.adk.workflow import START, Workflow
+from google.adk.workflow import START, FunctionNode, Workflow
 from google.genai import types
 from pydantic import ValidationError
 
@@ -685,6 +685,12 @@ async def human_approval_node(
     yield Event(output=final_result, content=content)
 
 
+resumable_human_approval_node = FunctionNode(
+    func=human_approval_node,
+    name="human_approval_node",
+    rerun_on_resume=True,
+)
+
 # Construct the ADK 2.0 Workflow Graph with Security Controls
 root_agent = Workflow(
     name="ambient_expense_agent",
@@ -705,10 +711,10 @@ root_agent = Workflow(
             security_checkpoint_node,
             {
                 "llm_review": llm_risk_review,
-                "security_flagged": human_approval_node,
+                "security_flagged": resumable_human_approval_node,
             },
         ),
-        (llm_risk_review, human_approval_node),
+        (llm_risk_review, resumable_human_approval_node),
     ],
 )
 

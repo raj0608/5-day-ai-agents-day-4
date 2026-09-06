@@ -40,7 +40,8 @@ from requests.exceptions import RequestException
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_URL = "http://127.0.0.1:8000"
+PORT = int(os.environ.get("TEST_PORT", "8008"))
+BASE_URL = os.environ.get("TEST_BASE_URL", f"http://127.0.0.1:{PORT}")
 RUN_SSE_URL = BASE_URL + "/run_sse"
 A2A_RPC_URL = BASE_URL + "/a2a/app/"
 AGENT_CARD_URL = A2A_RPC_URL + ".well-known/agent-card.json"
@@ -65,7 +66,7 @@ def start_server() -> subprocess.Popen[str]:
         "--host",
         "0.0.0.0",
         "--port",
-        "8000",
+        str(PORT),
     ]
     env = os.environ.copy()
     env["INTEGRATION_TEST"] = "TRUE"
@@ -90,11 +91,11 @@ def start_server() -> subprocess.Popen[str]:
 
 
 def wait_for_server(timeout: int = 90, interval: int = 1) -> bool:
-    """Wait for the server to be ready (agent card requires the lifespan to run)."""
+    """Wait for the server to be ready."""
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get(AGENT_CARD_URL, timeout=10)
+            response = requests.get(f"{BASE_URL}/health", timeout=10)
             if response.status_code == 200:
                 logger.info("Server is ready")
                 return True
