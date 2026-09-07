@@ -1,8 +1,6 @@
-# 5-Day AI Agents Intensive: Day 4 Workspace
+# Ambient Expense Agent
 
-Welcome to the Day 4 workspace of the **5-Day AI Agents: Intensive Vibe Coding Course with Google**. 
-
-This repository details the work done on Day 4, featuring a secure, production-ready, graph-based agent workflow built with **Google ADK 2.0** for **Ambient Expense Approval with Security Controls**.
+A secure, production-ready, graph-based autonomous agent workflow built with **Google ADK** and deployed to **Google Cloud Vertex AI Agent Runtime**, featuring Human-in-the-Loop (HITL) intercepts and deterministic prompt injection guardrails.
 
 ---
 
