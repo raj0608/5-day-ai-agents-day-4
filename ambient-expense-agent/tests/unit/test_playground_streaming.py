@@ -138,3 +138,55 @@ def test_playground_hitl_resumption(client):
     lines2 = [json.loads(line) for line in r2.text.splitlines() if line.strip()]
     assert len(lines2) >= 1
     assert any("EXPENSE DECISION [HUMAN_APPROVED]" in l["content"]["parts"][0]["text"] for l in lines2)
+
+
+def test_playground_consecutive_expenses_same_session(client):
+    """Verifies that consecutive auto-approved expenses in the same session both succeed and persist."""
+    session_id = "test-consecutive-expenses-sess"
+
+    # Turn 1: $45.50
+    t1_body = {
+        "user_id": "playground-user",
+        "session_id": session_id,
+        "input": {
+            "message": json.dumps(
+                {
+                    "amount": 45.50,
+                    "submitter": "alice@example.com",
+                    "category": "Meals",
+                    "description": "Team lunch meeting",
+                    "date": "2026-08-23",
+                }
+            )
+        },
+    }
+    r1 = client.post("/stream_reasoning_engine", json=t1_body)
+    assert r1.status_code == 200
+    lines1 = [json.loads(l) for l in r1.text.splitlines() if l.strip()]
+    assert len(lines1) == 1
+    assert "⚡ AUTO-APPROVED" in lines1[0]["content"]["parts"][0]["text"]
+    assert lines1[0]["output"]["amount"] == 45.50
+
+    # Turn 2: $99.99 in SAME session
+    t2_body = {
+        "user_id": "playground-user",
+        "session_id": session_id,
+        "input": {
+            "message": json.dumps(
+                {
+                    "amount": 99.99,
+                    "submitter": "alice@example.com",
+                    "category": "Supplies",
+                    "description": "Notebooks and pens",
+                    "date": "2026-08-23",
+                }
+            )
+        },
+    }
+    r2 = client.post("/stream_reasoning_engine", json=t2_body)
+    assert r2.status_code == 200
+    lines2 = [json.loads(l) for l in r2.text.splitlines() if l.strip()]
+    assert len(lines2) == 1
+    assert "⚡ AUTO-APPROVED" in lines2[0]["content"]["parts"][0]["text"]
+    assert lines2[0]["output"]["amount"] == 99.99
+

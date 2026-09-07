@@ -311,45 +311,67 @@ async def handle_reasoning_engine_playground(request: Request) -> Any:
 
     runner: Runner = app.state.runner
 
-    # Maintain session isolation:
-    # 1. If resuming from an interrupt, always use the original session_id.
-    # 2. If a session already finished its workflow (has terminal status), isolate the new submission
-    #    to prevent ADK ReplaySequenceBarrier divergence.
-    # 3. If a past session throws an ownership error (different user_id), isolate to avoid 400 ALREADY_EXISTS.
-    effective_session_id = session_id
-    if not is_resume:
+    # 1. Resolve session ownership: if the session exists in VertexAiSessionService,
+    # adopt the session's actual owner user_id (e.g. 'vais-query-reasoning-engine' or authenticated user)
+    # to avoid 400 ALREADY_EXISTS / ValueError ownership mismatch errors.
+    if hasattr(runner.session_service, "_get_api_client"):
         try:
-            existing_sess = await runner.session_service.get_session(
-                app_name=adk_app.name,
-                user_id=user_id,
-                session_id=session_id,
-            )
-            if existing_sess and existing_sess.events:
-                has_completed = any(
-                    isinstance(getattr(e, "output", None), dict) and "status" in e.output
-                    for e in existing_sess.events
+            engine_id = (
+                getattr(runner.session_service, "_agent_engine_id", None)
+                or (
+                    runner.session_service._get_reasoning_engine_id(adk_app.name)
+                    if hasattr(runner.session_service, "_get_reasoning_engine_id")
+                    else None
                 )
-                if has_completed:
-                    effective_session_id = f"{session_id}-t{int(time.time() * 1000)}"
-        except Exception:
-            # Past session belongs to a different user_id or is inaccessible; isolate to avoid ALREADY_EXISTS
-            effective_session_id = f"{session_id}-t{int(time.time() * 1000)}"
+            )
+            if engine_id:
+                async with runner.session_service._get_api_client() as api_client:
+                    res_name = f"reasoningEngines/{engine_id}/sessions/{session_id}"
+                    try:
+                        sess_res = await api_client.agent_engines.sessions.get(name=res_name)
+                        if sess_res and isinstance(getattr(sess_res, "user_id", None), str):
+                            user_id = sess_res.user_id
+                            logger.info(
+                                f"Adopting existing session owner user_id '{user_id}' for session '{session_id}'"
+                            )
+                    except Exception:
+                        pass
+        except Exception as owner_err:
+            logger.debug(f"Error checking session owner on Vertex AI: {owner_err}")
 
+    # 2. Get existing session or create a new session using the exact target session_id.
+    # Always preserve session_id across multi-turn chats so subsequent messages stay in the same session.
     try:
         session = await runner.session_service.get_session(
             app_name=adk_app.name,
             user_id=user_id,
-            session_id=effective_session_id,
+            session_id=session_id,
         )
-    except Exception:
+    except Exception as get_err:
+        logger.info(
+            f"get_session failed for '{session_id}' with user_id '{user_id}': {get_err}"
+        )
         session = None
 
     if not session:
-        session = await runner.session_service.create_session(
-            app_name=adk_app.name,
-            user_id=user_id,
-            session_id=effective_session_id,
-        )
+        try:
+            session = await runner.session_service.create_session(
+                app_name=adk_app.name,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except Exception as create_err:
+            logger.warning(
+                f"create_session failed for '{session_id}': {create_err}. Retrying get_session with default owner."
+            )
+            # Session already exists under another user_id that couldn't be fetched prior
+            session = await runner.session_service.get_session(
+                app_name=adk_app.name,
+                user_id="vais-query-reasoning-engine",
+                session_id=session_id,
+            )
+            if session:
+                user_id = "vais-query-reasoning-engine"
 
     async def json_stream() -> AsyncIterator[str]:
         async for event in runner.run_async(
@@ -365,21 +387,25 @@ async def handle_reasoning_engine_playground(request: Request) -> Any:
                         has_text = True
                         break
 
-            has_status = hasattr(event, "output") and isinstance(event.output, dict) and "status" in event.output
-
-            # Suppress internal node execution events that have neither user-facing text nor final status
-            # This prevents empty assistant chat bubbles (#5, #6) from appearing in the Playground UI
-            if not has_text and not has_status:
+            # Suppress internal node execution events that have no user-facing text.
+            # This completely eliminates empty assistant chat bubbles (#2, #5) in the Playground UI.
+            if not has_text:
                 continue
 
+            has_status = (
+                hasattr(event, "output")
+                and isinstance(event.output, dict)
+                and "status" in event.output
+            )
+
             event_payload: dict[str, Any] = {}
-            if has_text and hasattr(event, "content") and event.content:
+            if hasattr(event, "content") and event.content:
                 event_payload["content"] = event.content.model_dump(
                     mode="json", exclude_none=True
                 )
             if has_status and hasattr(event, "output") and event.output:
                 event_payload["output"] = event.output
-            if has_text and hasattr(event, "author") and event.author:
+            if hasattr(event, "author") and event.author:
                 event_payload["author"] = event.author
 
             yield f"{json.dumps(event_payload)}\n"
