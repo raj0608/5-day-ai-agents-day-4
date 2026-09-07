@@ -37,7 +37,11 @@ htmlcov/
 .google-agents-cli/
 .persist_vector_store/
 .saved_chats/
+.session_cutoff
+*.log
 *.tfvars
 *-key.json
 credentials*.json
+service-account*.json
+client_secret*.json
 *.pem
